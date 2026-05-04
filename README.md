@@ -5,6 +5,9 @@ around a deterministic Coordinator that orchestrates an LLM through a constraine
 tool API. The system demonstrates how to keep agentic systems safe, observable, and
 testable in environments where LLM mistakes have financial consequences.
 
+The focus of this project lays on the applicance of domain driven design with bounded
+contexts as well as industry grade three pillar observability.
+
 ## Motivation
 
 The idea predates this implementation by several years. As a P2P accountant
@@ -25,11 +28,17 @@ In a typical Accounts Payable department, clerks process invoices through a fixe
 sequence of checks: validate the invoice against its purchase order, verify supplier
 status, route for approval if the amount exceeds limits, post to SAP. Most of this
 work is rule-driven and repetitive, but enough edge cases exist that pure RPA
-solutions cannot handle the long tail.
+solutions cannot handle the long tail. I call those cases "Mid Level Complexity":
+Simple enough that a LLM can grasp the case, but complex enough that traditional 
+automation measures that are often deterministic and rules based cannot handle them.
 
 This system uses an LLM to drive the workflow autonomously. The LLM decides which
 tools to call in which order. A deterministic Coordinator wraps the LLM, enforces
 business rules through pure-Python verification, and routes failures by category.
+
+As an example use-case, my fictional client reached out to me, and in an ideation
+workshop I uncovered 12 different scenarios, where the traditional invoice posting
+software fails, but are in scope of a agentic solution.
 
 | Metric | Result |
 |---|---|
