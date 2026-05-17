@@ -110,10 +110,18 @@ class Coordinator:
             task=task,
         )
 
+        # Initial LLM call: no tool results yet, so we use start() instead of
+        # continue_with_results(). Tracing is covered by the parent
+        # coordinator.run span. The single-turn protocol is documented in ADR-003.
         response = self._client.start(
             system_prompt=self._system_prompt,
             task=task,
             tool_schemas=self._tool_schemas,
+        )
+        logger.info(
+            "coordinator.initial_call",
+            stop_reason=response.stop_reason,
+            tool_calls_count=len(response.tool_calls),
         )
 
         for iteration in range(_MAX_ITERATIONS):
