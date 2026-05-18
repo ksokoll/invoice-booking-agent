@@ -19,7 +19,7 @@ Architecture:
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from opentelemetry import trace
 
@@ -176,11 +176,11 @@ class Coordinator:
 
         Args:
             tool_call: The LLM-issued tool call to execute.
-            state: Mutable accumulated state for the current run. Keys
-                written by earlier tools (for example
-                `invoice_amount_eur` from `get_invoice_data`) are read
-                here, and this method may add further keys via
-                `_update_state`.
+            state: Mutable accumulated state for the current run.
+                Fields written by earlier tools (for example
+                `invoice_amount_eur` from `get_invoice_data`) are
+                read here, and the tool's own `update_state` may
+                add further fields.
             invoice_id: The invoice being booked. Flows into span
                 attributes and failure messages.
 
@@ -221,15 +221,10 @@ class Coordinator:
                 invoice_id=invoice_id,
             )
 
-        # --- Pre-Execute Verification ---
-        # Dispatch in two layers during the lifecycle migration: the tool's
-        # own verify_before fires first; if it returns None we fall back to
-        # the Coordinator's legacy branches for tools not yet migrated.
+        # --- Pre-Execute Verification (delegated to the tool) ---
         with tracer.start_as_current_span("verification.pre_execute") as verif_span:
             verif_span.set_attribute("tool_name", tool_call.name)
-            pre_failure = tool.verify_before(
-                tool_call.params, state, invoice_id
-            ) or self._pre_execute_verify(tool_call, state, invoice_id)
+            pre_failure = tool.verify_before(tool_call.params, state, invoice_id)
             if pre_failure is not None:
                 verif_span.set_attribute("rule", pre_failure.rule)
                 verif_span.set_attribute("outcome", "failed")
@@ -248,6 +243,10 @@ class Coordinator:
         )
 
         # --- Escalation hook ---
+        # The terminal-status decision for escalate_to_human is a genuine
+        # Coordinator concern (flow control), not a per-tool concern. It
+        # stays here intentionally and is the only tool name the
+        # Coordinator still knows by string.
         if tool_call.name == "escalate_to_human":
             span.set_attribute("outcome", "escalated")
             record_tool_call(tool_call.name, "escalated")
@@ -257,13 +256,10 @@ class Coordinator:
                 invoice_id=invoice_id,
             )
 
-        # --- Post-Execute Verification ---
-        # Same two-layer dispatch as for pre-execute.
+        # --- Post-Execute Verification (delegated to the tool) ---
         with tracer.start_as_current_span("verification.post_execute") as verif_span:
             verif_span.set_attribute("tool_name", tool_call.name)
-            post_failure = tool.verify_after(
-                tool_call.params, raw_result, state, invoice_id
-            ) or self._post_execute_verify(tool_call, raw_result, state, invoice_id)
+            post_failure = tool.verify_after(tool_call.params, raw_result, state, invoice_id)
             if post_failure is not None:
                 verif_span.set_attribute("rule", post_failure.rule)
                 verif_span.set_attribute("outcome", "failed")
@@ -273,87 +269,14 @@ class Coordinator:
                 )
                 return self._route_failure(post_failure, tool_call, invoice_id)
 
-        # State update: tool-side first (no-op for non-migrated tools), then
-        # Coordinator's legacy branches for the tools still living here.
         tool.update_state(raw_result, state)
-        self._update_state(tool_call.name, raw_result, state)
         span.set_attribute("outcome", "ok")
         record_tool_call(tool_call.name, "ok")
 
-        # Compression: identity check distinguishes migrated tools (which
-        # return a new dict) from non-migrated tools (DefaultTool returns
-        # the raw_result reference unchanged).
-        compressed = tool.compress_result(raw_result, state)
-        if compressed is raw_result:
-            content = self._compress_tool_result(tool_call.name, raw_result, state)
-        else:
-            content = json.dumps(compressed)
-        return ToolResult(tool_call_id=tool_call.id, content=content)
-
-    # Tools still compressed via the legacy Coordinator path. Empty now
-    # that all SAP read tools own their own compress_result.
-    _COMPRESSIBLE_TOOLS: frozenset[str] = frozenset()
-
-    def _compress_tool_result(
-        self,
-        tool_name: str,
-        raw_result: dict[str, Any],
-        state: WorkflowState,
-    ) -> str:
-        """Return the LLM-facing payload for a tool result.
-
-        Read-tool results can be bulky (full invoice records,
-        supplier rules, PO limits). Sending them verbatim back into
-        the LLM context wastes tokens and tends to confuse the
-        model, because the same fields reappear on every iteration.
-        The Coordinator already materialises the relevant fields
-        into `state`, so the LLM does not need to see the raw
-        payload a second time.
-
-        For tools in `_COMPRESSIBLE_TOOLS` whose lookup succeeded
-        (`found` is truthy), this method replaces the full payload
-        with a small pointer object that names the tool, marks the
-        data as materialised in state, and embeds a short summary of
-        the key fields from state. All other tool results (write
-        tools, not-found lookups, and any tool not in
-        `_COMPRESSIBLE_TOOLS`) pass through unchanged.
-
-        Args:
-            tool_name: The tool whose result is being compressed.
-            raw_result: The tool's full result dict.
-            state: The accumulated state for this run, used to pull
-                the fields that go into the summary.
-
-        Returns:
-            A JSON string that the Coordinator places on the outgoing
-            `ToolResult`. Either the pointer object (for compressed
-            read-tool results) or a direct dump of `raw_result`.
-        """
-        if tool_name not in self._COMPRESSIBLE_TOOLS:
-            return json.dumps(raw_result)
-
-        if not raw_result.get("found", True):
-            return json.dumps(raw_result)
-
-        pointer = {
-            "status": "materialised_in_state",
-            "tool": tool_name,
-            "summary": self._summarise_for_llm(tool_name, state),
-        }
-        return json.dumps(pointer)
-
-    def _summarise_for_llm(
-        self,
-        tool_name: str,
-        state: WorkflowState,
-    ) -> dict[str, Any]:
-        """Build a short summary of the materialised state for one tool.
-
-        All SAP read tools own their own compress_result and never reach
-        this fallback. Retained until the final cleanup commit removes
-        the legacy compression path entirely.
-        """
-        return {}
+        return ToolResult(
+            tool_call_id=tool_call.id,
+            content=json.dumps(tool.compress_result(raw_result, state)),
+        )
 
     _STATUS_MAP: ClassVar[dict[str, AgentStatus]] = {
         "not_found": AgentStatus.BLOCKED_NOT_FOUND,
@@ -439,132 +362,3 @@ class Coordinator:
             )
         return self._failure_to_result(failure, invoice_id)
 
-    def _pre_execute_verify(
-        self,
-        tool_call: ToolCall,
-        state: WorkflowState,
-        invoice_id: str,
-    ) -> Any:
-        """Run checks that must fire before the tool executes.
-
-        Pre-execute checks guard against three categories:
-
-        1. Budgeted resources: `consult_procurement` has a per-
-           invoice limit (`_MAX_CONSULTATIONS_PER_INVOICE`). Once
-           reached, further consultations are refused as a hard
-           failure so the agent must escalate.
-        2. Coordinator-managed parameters: `request_approval` needs
-           a recipient. The recipient is deterministic from the
-           prior `get_po_limit` call (see ADR-005). If that call
-           has not been made, the tool call is refused; otherwise
-           the recipient is injected into the tool call params.
-        3. Confused-deputy guards on `book_invoice`: the invoice
-           amount must have been fetched (no booking on phantom
-           state), the LLM-supplied amount must match the recorded
-           amount (no tampering), and the invoice must not already
-           be booked; above the approval threshold, approval must
-           have been recorded.
-
-        Args:
-            tool_call: The tool call about to execute. The method
-                may mutate its `params` dict for the
-                Coordinator-managed-parameter case.
-            state: Accumulated state for this run. Used for every
-                check above.
-            invoice_id: The invoice being booked; surfaced in
-                failure reasons.
-
-        Returns:
-            `None` when the tool call is allowed to proceed. A
-            `VerificationFailure` when a guard fires; the rule name
-            identifies which guard.
-        """
-        # All pre-execute guards now live on the tools themselves
-        # (BookingTool, ApprovalTool, ConsultProcurementTool). This
-        # method is retained as a no-op fallback until the final
-        # cleanup commit removes it.
-        return None
-
-    def _post_execute_verify(
-        self,
-        tool_call: ToolCall,
-        result: dict[str, Any],
-        state: WorkflowState,
-        invoice_id: str,
-    ) -> Any:
-        """Run checks that require the tool result.
-
-        Post-execute checks apply the pure verification rules from
-        `app.verification.rules` to the combination of the tool
-        result and the accumulated state. The checks are ordered:
-
-        1. `not_found` for the four SAP lookup tools.
-        2. `limit_not_exceeded` whenever both amount and limit are
-           known; the check fires from either direction depending on
-           which of `get_po_limit` and `get_invoice_data` was
-           called first.
-        3. Supplier rules: `supplier_active` and, when the invoice
-           cost center is already known, `cost_center_allowed`.
-        4. `budget_sufficient` when both amount and budget are
-           known.
-        5. `approval_consistent` on `request_approval` results.
-           This check also records the recipient in
-           `state.approvals_received` when the approval was
-           granted, so the subsequent `approval_required` check on
-           `book_invoice` can see it.
-
-        Args:
-            tool_call: The tool call that just executed.
-            result: The raw result dict returned by the tool.
-            state: Accumulated state; read for cross-tool
-                invariants and updated with the approval list when
-                appropriate.
-            invoice_id: The invoice being booked; surfaced in
-                failure reasons.
-
-        Returns:
-            `None` when every applicable check passed. The first
-            `VerificationFailure` encountered otherwise.
-        """
-        # All post-execute checks now live on the tools themselves
-        # (InvoiceTool, POTool, SupplierRulesTool, BudgetTool,
-        # ApprovalTool). Retained as a no-op fallback until the
-        # final cleanup commit removes it.
-        return None
-
-    def _update_state(
-        self,
-        tool_name: str,
-        result: dict[str, Any],
-        state: WorkflowState,
-    ) -> None:
-        """Update accumulated state after a successful tool call.
-
-        Each successful read tool contributes a known set of fields
-        to `state`. Subsequent verification checks and the
-        `_summarise_for_llm` helper read from those fields, so the
-        contract is stable per tool:
-
-        - `get_invoice_data` (found): writes `invoice_id`,
-          `invoice_amount_eur`, `invoice_po_number`,
-          `invoice_contact_person`, `invoice_supplier_id`,
-          `invoice_cost_center`.
-        - `get_supplier_rules` (found): writes
-          `supplier_approval_threshold_eur`.
-        - `get_budget` (found): writes `budget_remaining_eur`.
-        - `get_po_limit` (found): writes `po_limit_eur` and
-          `po_responsible_person`. The latter is the Coordinator-
-          managed recipient for `request_approval` (see ADR-005).
-        - `book_invoice` (booked): writes `booked=True`, which
-          determines the terminal status in `run`.
-
-        Args:
-            tool_name: The tool whose result is being folded into
-                state.
-            result: The tool's raw result dict.
-            state: The mutable WorkflowState for this run.
-        """
-        # All state updates now live on the tools themselves.
-        # Retained as a no-op fallback until the final cleanup commit
-        # removes it.
-        return None
