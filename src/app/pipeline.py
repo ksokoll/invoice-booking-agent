@@ -123,9 +123,7 @@ class Coordinator:
 
                 if response.stop_reason == "end_turn":
                     status = (
-                        AgentStatus.BOOKED
-                        if state.booked
-                        else AgentStatus.BLOCKED_AGENT_ABANDONED
+                        AgentStatus.BOOKED if state.booked else AgentStatus.BLOCKED_AGENT_ABANDONED
                     )
                     result = CoordinatorResult(
                         status=status,
@@ -291,7 +289,7 @@ class Coordinator:
         "approval_required": AgentStatus.BLOCKED_APPROVAL_MISSING,
         "missing_po_data": AgentStatus.BLOCKED_MISSING_PO_DATA,
         "consultation_limit_exceeded": AgentStatus.BLOCKED_AGENT_ABANDONED,
-}
+    }
 
     def _failure_to_result(
         self,
@@ -361,4 +359,3 @@ class Coordinator:
                 content=json.dumps(payload),
             )
         return self._failure_to_result(failure, invoice_id)
-

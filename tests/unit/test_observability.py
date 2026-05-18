@@ -208,9 +208,7 @@ class TestTracedDecorator:
         attrs = dict(spans[0].attributes or {})
         assert "payload" not in attrs
 
-    def test_return_value_is_passed_through(
-        self, captured_spans: InMemorySpanExporter
-    ) -> None:
+    def test_return_value_is_passed_through(self, captured_spans: InMemorySpanExporter) -> None:
         class Subject:
             @traced("subject.do")
             def do(self) -> dict[str, int]:
@@ -218,9 +216,7 @@ class TestTracedDecorator:
 
         assert Subject().do() == {"answer": 42}
 
-    def test_exception_is_not_swallowed(
-        self, captured_spans: InMemorySpanExporter
-    ) -> None:
+    def test_exception_is_not_swallowed(self, captured_spans: InMemorySpanExporter) -> None:
         class BoomError(Exception):
             pass
 
