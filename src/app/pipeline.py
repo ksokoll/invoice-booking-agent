@@ -26,6 +26,7 @@ from opentelemetry import trace
 from app.core.failures import CONSULTABLE_RULES, VerificationFailure
 from app.core.results import CoordinatorResult, ToolCall, ToolResult
 from app.core.statuses import AgentStatus
+from app.core.workflow_state import WorkflowState
 from app.prompts import SYSTEM_PROMPT
 from app.services.observability import (
     get_logger,
@@ -98,7 +99,7 @@ class Coordinator:
         cid = new_correlation_id()
         set_correlation_id(cid)
 
-        state: dict[str, Any] = {}
+        state = WorkflowState()
         record_run_started()
 
         run_span = trace.get_current_span()
@@ -138,7 +139,7 @@ class Coordinator:
                 if response.stop_reason == "end_turn":
                     status = (
                         AgentStatus.BOOKED
-                        if state.get("booked")
+                        if state.booked
                         else AgentStatus.BLOCKED_AGENT_ABANDONED
                     )
                     result = CoordinatorResult(
@@ -178,7 +179,7 @@ class Coordinator:
     def _execute_tool_call(
         self,
         tool_call: ToolCall,
-        state: dict[str, Any],
+        state: WorkflowState,
         invoice_id: str,
     ) -> ToolResult | CoordinatorResult:
         """Run one tool call through the gate, execute, and verify.
@@ -281,7 +282,7 @@ class Coordinator:
 
         # --- Increment consultation counter ---
         if tool_call.name == "consult_procurement":
-            state["consultations_used"] = state.get("consultations_used", 0) + 1
+            state.consultations_used += 1
 
         self._update_state(tool_call.name, raw_result, state)
         span.set_attribute("outcome", "ok")
@@ -305,7 +306,7 @@ class Coordinator:
         self,
         tool_name: str,
         raw_result: dict[str, Any],
-        state: dict[str, Any],
+        state: WorkflowState,
     ) -> str:
         """Return the LLM-facing payload for a tool result.
 
@@ -352,25 +353,25 @@ class Coordinator:
     def _summarise_for_llm(
         self,
         tool_name: str,
-        state: dict[str, Any],
+        state: WorkflowState,
     ) -> dict[str, Any]:
         """Build a short summary of the materialised state for one tool."""
         if tool_name == "get_invoice_data":
             return {
-                "invoice_id": state.get("invoice_id"),
-                "amount_eur": state.get("invoice_amount_eur"),
-                "po_number": state.get("invoice_po_number"),
-                "supplier_id": state.get("invoice_supplier_id"),
-                "cost_center": state.get("invoice_cost_center"),
+                "invoice_id": state.invoice_id,
+                "amount_eur": state.invoice_amount_eur,
+                "po_number": state.invoice_po_number,
+                "supplier_id": state.invoice_supplier_id,
+                "cost_center": state.invoice_cost_center,
             }
         if tool_name == "get_supplier_rules":
             return {
-                "approval_threshold_eur": state.get("supplier_approval_threshold_eur"),
+                "approval_threshold_eur": state.supplier_approval_threshold_eur,
             }
         if tool_name == "get_po_limit":
-            return {"limit_eur": state.get("po_limit_eur")}
+            return {"limit_eur": state.po_limit_eur}
         if tool_name == "get_budget":
-            return {"remaining_eur": state.get("budget_remaining_eur")}
+            return {"remaining_eur": state.budget_remaining_eur}
         return {}
 
     _STATUS_MAP: ClassVar[dict[str, AgentStatus]] = {
@@ -460,7 +461,7 @@ class Coordinator:
     def _pre_execute_verify(
         self,
         tool_call: ToolCall,
-        state: dict[str, Any],
+        state: WorkflowState,
         invoice_id: str,
     ) -> Any:
         """Run checks that must fire before the tool executes.
@@ -498,7 +499,7 @@ class Coordinator:
             identifies which guard.
         """
         if tool_call.name == "consult_procurement":
-            used = state.get("consultations_used", 0)
+            used = state.consultations_used
             if used >= _MAX_CONSULTATIONS_PER_INVOICE:
                 return VerificationFailure(
                     rule="consultation_limit_exceeded",
@@ -511,7 +512,7 @@ class Coordinator:
             return None
 
         if tool_call.name == "request_approval":
-            state_recipient = state.get("po_responsible_person")
+            state_recipient = state.po_responsible_person
             if state_recipient is None:
                 return VerificationFailure(
                     rule="missing_po_data",
@@ -536,7 +537,7 @@ class Coordinator:
 
         params = tool_call.params
 
-        state_amount = state.get("invoice_amount_eur")
+        state_amount = state.invoice_amount_eur
         if state_amount is None:
             return VerificationFailure(
                 rule="missing_invoice_state",
@@ -570,8 +571,12 @@ class Coordinator:
         failure = check_approval_required(
             invoice_id=invoice_id,
             amount_eur=authoritative_amount,
-            approval_received=bool(state.get("approvals_received")),
-            threshold_eur=state.get("supplier_approval_threshold_eur", APPROVAL_THRESHOLD_EUR),
+            approval_received=bool(state.approvals_received),
+            threshold_eur=(
+                state.supplier_approval_threshold_eur
+                if state.supplier_approval_threshold_eur is not None
+                else APPROVAL_THRESHOLD_EUR
+            ),
         )
         if failure:
             return failure
@@ -582,7 +587,7 @@ class Coordinator:
         self,
         tool_call: ToolCall,
         result: dict[str, Any],
-        state: dict[str, Any],
+        state: WorkflowState,
         invoice_id: str,
     ) -> Any:
         """Run checks that require the tool result.
@@ -602,7 +607,7 @@ class Coordinator:
            known.
         5. `approval_consistent` on `request_approval` results.
            This check also records the recipient in
-           `state["approvals_received"]` when the approval was
+           `state.approvals_received` when the approval was
            granted, so the subsequent `approval_required` check on
            `book_invoice` can see it.
 
@@ -635,20 +640,28 @@ class Coordinator:
                 return failure
 
         # 2. Limit check.
-        if tool_name == "get_po_limit" and result.get("found") and "invoice_amount_eur" in state:
+        if (
+            tool_name == "get_po_limit"
+            and result.get("found")
+            and state.invoice_amount_eur is not None
+        ):
             failure = check_limit_not_exceeded(
-                amount_eur=state["invoice_amount_eur"],
+                amount_eur=state.invoice_amount_eur,
                 limit_eur=result["limit_eur"],
-                invoice_id=state.get("invoice_id", invoice_id),
+                invoice_id=state.invoice_id if state.invoice_id is not None else invoice_id,
                 po_number=result["po_number"],
             )
             if failure:
                 return failure
 
-        if tool_name == "get_invoice_data" and result.get("found") and "po_limit_eur" in state:
+        if (
+            tool_name == "get_invoice_data"
+            and result.get("found")
+            and state.po_limit_eur is not None
+        ):
             failure = check_limit_not_exceeded(
                 amount_eur=result["net_amount_eur"],
-                limit_eur=state["po_limit_eur"],
+                limit_eur=state.po_limit_eur,
                 invoice_id=result["invoice_id"],
                 po_number=result["po_number"],
             )
@@ -663,9 +676,9 @@ class Coordinator:
             )
             if failure:
                 return failure
-            if "invoice_cost_center" in state:
+            if state.invoice_cost_center is not None:
                 failure = check_cost_center_allowed(
-                    cost_center=state["invoice_cost_center"],
+                    cost_center=state.invoice_cost_center,
                     allowed_cost_centers=result["allowed_cost_centers"],
                     invoice_id=invoice_id,
                 )
@@ -673,9 +686,13 @@ class Coordinator:
                     return failure
 
         # 4. Budget check.
-        if tool_name == "get_budget" and result.get("found") and "invoice_amount_eur" in state:
+        if (
+            tool_name == "get_budget"
+            and result.get("found")
+            and state.invoice_amount_eur is not None
+        ):
             failure = check_budget_sufficient(
-                amount_eur=state["invoice_amount_eur"],
+                amount_eur=state.invoice_amount_eur,
                 remaining_budget_eur=result["remaining_eur"],
                 cost_center=result["cost_center"],
                 invoice_id=invoice_id,
@@ -685,19 +702,18 @@ class Coordinator:
 
         # 5. Approval contradiction check.
         if tool_name == "request_approval":
-            if "invoice_amount_eur" in state and "po_limit_eur" in state:
+            if state.invoice_amount_eur is not None and state.po_limit_eur is not None:
                 failure = check_approval_consistent(
                     approved=result["approved"],
                     stated_reason=result["reason"],
-                    expected_limit_eur=state["po_limit_eur"],
-                    actual_amount_eur=state["invoice_amount_eur"],
+                    expected_limit_eur=state.po_limit_eur,
+                    actual_amount_eur=state.invoice_amount_eur,
                     recipient=params["recipient"],
                 )
                 if failure:
                     return failure
             if result.get("approved"):
-                approvals: list[str] = state.setdefault("approvals_received", [])
-                approvals.append(params["recipient"])
+                state.approvals_received.append(params["recipient"])
 
         return None
 
@@ -705,7 +721,7 @@ class Coordinator:
         self,
         tool_name: str,
         result: dict[str, Any],
-        state: dict[str, Any],
+        state: WorkflowState,
     ) -> None:
         """Update accumulated state after a successful tool call.
 
@@ -731,25 +747,25 @@ class Coordinator:
             tool_name: The tool whose result is being folded into
                 state.
             result: The tool's raw result dict.
-            state: The mutable state dict for this run.
+            state: The mutable WorkflowState for this run.
         """
         if tool_name == "get_invoice_data" and result.get("found"):
-            state["invoice_id"] = result["invoice_id"]
-            state["invoice_amount_eur"] = result["net_amount_eur"]
-            state["invoice_po_number"] = result["po_number"]
-            state["invoice_contact_person"] = result.get("contact_person", "")
-            state["invoice_supplier_id"] = result.get("supplier_id", "")
-            state["invoice_cost_center"] = result.get("cost_center", "")
+            state.invoice_id = result["invoice_id"]
+            state.invoice_amount_eur = result["net_amount_eur"]
+            state.invoice_po_number = result["po_number"]
+            state.invoice_contact_person = result.get("contact_person", "")
+            state.invoice_supplier_id = result.get("supplier_id", "")
+            state.invoice_cost_center = result.get("cost_center", "")
 
         if tool_name == "get_supplier_rules" and result.get("found"):
-            state["supplier_approval_threshold_eur"] = result["approval_threshold_eur"]
+            state.supplier_approval_threshold_eur = result["approval_threshold_eur"]
 
         if tool_name == "get_budget" and result.get("found"):
-            state["budget_remaining_eur"] = result["remaining_eur"]
+            state.budget_remaining_eur = result["remaining_eur"]
 
         if tool_name == "get_po_limit" and result.get("found"):
-            state["po_limit_eur"] = result["limit_eur"]
-            state["po_responsible_person"] = result["responsible_person"]
+            state.po_limit_eur = result["limit_eur"]
+            state.po_responsible_person = result["responsible_person"]
 
         if tool_name == "book_invoice" and result.get("booked"):
-            state["booked"] = True
+            state.booked = True
