@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from app.services.permission_gate import PermissionLevel
+from app.services.tool_base import DefaultTool
 
 
-class ConsultProcurementTool:
+class ConsultProcurementTool(DefaultTool):
     """Sends a question to the Procurement team and returns their response."""
 
     name = "consult_procurement"

@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from app.services.permission_gate import PermissionLevel
+from app.services.tool_base import DefaultTool
 
 
-class EscalateToHumanTool:
+class EscalateToHumanTool(DefaultTool):
     """Hands the invoice off to a human AP clerk for manual review."""
 
     name = "escalate_to_human"

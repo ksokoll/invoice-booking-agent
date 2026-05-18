@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from app.services.permission_gate import PermissionLevel
+from app.services.tool_base import DefaultTool
 
 
-class ApprovalTool:
+class ApprovalTool(DefaultTool):
     """Sends an approval request and returns a simulated response."""
 
     name = "request_approval"

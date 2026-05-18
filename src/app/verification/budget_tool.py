@@ -5,12 +5,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from app.services.permission_gate import PermissionLevel
+from app.services.tool_base import DefaultTool
 
 if TYPE_CHECKING:
     from app.core.entities import BudgetRecord
 
 
-class BudgetTool:
+class BudgetTool(DefaultTool):
     """Fetches the remaining budget for a cost center."""
 
     name = "get_budget"

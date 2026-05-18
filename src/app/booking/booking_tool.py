@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from app.services.permission_gate import PermissionLevel
+from app.services.tool_base import DefaultTool
 
 
-class BookingTool:
+class BookingTool(DefaultTool):
     """Executes the final invoice booking. WRITE-level tool."""
 
     name = "book_invoice"
