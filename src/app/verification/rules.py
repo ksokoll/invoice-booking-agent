@@ -49,6 +49,7 @@ def check_limit_not_exceeded(
                 f"PO {po_number} limit of {limit_eur:.2f} EUR. "
                 "Booking blocked."
             ),
+            consultable=True,
         )
     return None
 
@@ -106,6 +107,7 @@ def check_approval_consistent(
                 f"{expected_limit_eur:.2f} EUR. "
                 "This is a contradiction, escalating for manual review."
             ),
+            consultable=False,
         )
     return None
 
@@ -155,6 +157,7 @@ def check_not_found(
                 f"Tool '{tool_name}' could not find record '{identifier}'. "
                 "Booking blocked until data is resolved."
             ),
+            consultable=False,
         )
     return None
 
@@ -168,6 +171,7 @@ def check_not_already_booked(
         return VerificationFailure(
             rule="not_already_booked",
             reason=(f"Invoice {invoice_id} has already been booked. Duplicate booking blocked."),
+            consultable=False,
         )
     return None
 
@@ -187,6 +191,7 @@ def check_approval_required(
                 f"approval threshold of {threshold_eur:.2f} EUR. "
                 "Explicit approval required before booking."
             ),
+            consultable=False,
         )
     return None
 
@@ -206,6 +211,7 @@ def check_budget_sufficient(
                 f"remaining budget of {remaining_budget_eur:.2f} EUR "
                 f"for cost center '{cost_center}'. Booking blocked."
             ),
+            consultable=True,
         )
     return None
 
@@ -219,6 +225,7 @@ def check_supplier_active(
         return VerificationFailure(
             rule="supplier_active",
             reason=(f"Supplier {supplier_id} is inactive. Booking blocked."),
+            consultable=False,
         )
     return None
 
@@ -236,5 +243,6 @@ def check_cost_center_allowed(
                 f"Cost center '{cost_center}' is not in the allowed list for this supplier "
                 f"on invoice {invoice_id}. Allowed: {allowed_cost_centers}. Booking blocked."
             ),
+            consultable=False,
         )
     return None
