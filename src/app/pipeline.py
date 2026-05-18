@@ -530,6 +530,7 @@ class Coordinator:
             tool_call.params["recipient"] = state_recipient
             return None
 
+        # Early Exit if "book invoice" wasn't chosen
         if tool_call.name != "book_invoice":
             return None
 
@@ -622,6 +623,7 @@ class Coordinator:
         params = tool_call.params
 
         # 1. Not-found check.
+        # Check tool results if fetch-took, and convert found=False into a tangible VerificationError via check_not_found
         if tool_name in (
             "get_invoice_data",
             "get_po_limit",
