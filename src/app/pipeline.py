@@ -45,12 +45,7 @@ from app.verification.rules import (
     APPROVAL_THRESHOLD_EUR,
     check_approval_consistent,
     check_approval_required,
-    check_budget_sufficient,
-    check_cost_center_allowed,
-    check_limit_not_exceeded,
     check_not_already_booked,
-    check_not_found,
-    check_supplier_active,
 )
 
 if TYPE_CHECKING:
@@ -309,15 +304,9 @@ class Coordinator:
             content = json.dumps(compressed)
         return ToolResult(tool_call_id=tool_call.id, content=content)
 
-    # Tools still compressed via the legacy Coordinator path. Entries are
-    # removed as each tool implements compress_result in its own class.
-    _COMPRESSIBLE_TOOLS: frozenset[str] = frozenset(
-        {
-            "get_supplier_rules",
-            "get_po_limit",
-            "get_budget",
-        }
-    )
+    # Tools still compressed via the legacy Coordinator path. Empty now
+    # that all SAP read tools own their own compress_result.
+    _COMPRESSIBLE_TOOLS: frozenset[str] = frozenset()
 
     def _compress_tool_result(
         self,
@@ -372,16 +361,12 @@ class Coordinator:
         tool_name: str,
         state: WorkflowState,
     ) -> dict[str, Any]:
-        """Build a short summary of the materialised state for one tool."""
-        # get_invoice_data moved to InvoiceTool.compress_result.
-        if tool_name == "get_supplier_rules":
-            return {
-                "approval_threshold_eur": state.supplier_approval_threshold_eur,
-            }
-        if tool_name == "get_po_limit":
-            return {"limit_eur": state.po_limit_eur}
-        if tool_name == "get_budget":
-            return {"remaining_eur": state.budget_remaining_eur}
+        """Build a short summary of the materialised state for one tool.
+
+        All SAP read tools own their own compress_result and never reach
+        this fallback. Retained until the final cleanup commit removes
+        the legacy compression path entirely.
+        """
         return {}
 
     _STATUS_MAP: ClassVar[dict[str, AgentStatus]] = {
@@ -641,64 +626,8 @@ class Coordinator:
         tool_name = tool_call.name
         params = tool_call.params
 
-        # 1. Not-found check (still here for tools not yet migrated to the
-        # per-tool lifecycle; migrated tools handle this in verify_after).
-        if tool_name in (
-            "get_po_limit",
-            "get_supplier_rules",
-            "get_budget",
-        ):
-            failure = check_not_found(tool_name, result)
-            if failure:
-                return failure
-
-        # 2. Limit check (still here for get_po_limit, which has not yet
-        # been migrated; get_invoice_data's branch moved into InvoiceTool).
-        if (
-            tool_name == "get_po_limit"
-            and result.get("found")
-            and state.invoice_amount_eur is not None
-        ):
-            failure = check_limit_not_exceeded(
-                amount_eur=state.invoice_amount_eur,
-                limit_eur=result["limit_eur"],
-                invoice_id=state.invoice_id if state.invoice_id is not None else invoice_id,
-                po_number=result["po_number"],
-            )
-            if failure:
-                return failure
-
-        # 3. Supplier-rules checks.
-        if tool_name == "get_supplier_rules" and result.get("found"):
-            failure = check_supplier_active(
-                supplier_id=result["supplier_id"],
-                active=result["active"],
-            )
-            if failure:
-                return failure
-            if state.invoice_cost_center is not None:
-                failure = check_cost_center_allowed(
-                    cost_center=state.invoice_cost_center,
-                    allowed_cost_centers=result["allowed_cost_centers"],
-                    invoice_id=invoice_id,
-                )
-                if failure:
-                    return failure
-
-        # 4. Budget check.
-        if (
-            tool_name == "get_budget"
-            and result.get("found")
-            and state.invoice_amount_eur is not None
-        ):
-            failure = check_budget_sufficient(
-                amount_eur=state.invoice_amount_eur,
-                remaining_budget_eur=result["remaining_eur"],
-                cost_center=result["cost_center"],
-                invoice_id=invoice_id,
-            )
-            if failure:
-                return failure
+        # SAP read-tool checks (not_found, limit, supplier rules, budget)
+        # moved into each tool's verify_after.
 
         # 5. Approval contradiction check.
         if tool_name == "request_approval":
@@ -749,17 +678,8 @@ class Coordinator:
             result: The tool's raw result dict.
             state: The mutable WorkflowState for this run.
         """
-        # get_invoice_data moved to InvoiceTool.update_state.
-
-        if tool_name == "get_supplier_rules" and result.get("found"):
-            state.supplier_approval_threshold_eur = result["approval_threshold_eur"]
-
-        if tool_name == "get_budget" and result.get("found"):
-            state.budget_remaining_eur = result["remaining_eur"]
-
-        if tool_name == "get_po_limit" and result.get("found"):
-            state.po_limit_eur = result["limit_eur"]
-            state.po_responsible_person = result["responsible_person"]
-
+        # All SAP read-tool state updates moved into each tool's
+        # update_state. book_invoice remains here until BookingTool is
+        # migrated in the next commit.
         if tool_name == "book_invoice" and result.get("booked"):
             state.booked = True

@@ -6,9 +6,12 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from app.services.permission_gate import PermissionLevel
 from app.services.tool_base import DefaultTool
+from app.verification.rules import check_limit_not_exceeded, check_not_found
 
 if TYPE_CHECKING:
     from app.core.entities import PORecord
+    from app.core.failures import VerificationFailure
+    from app.core.workflow_state import WorkflowState
 
 
 class POTool(DefaultTool):
@@ -54,4 +57,46 @@ class POTool(DefaultTool):
             "po_number": record.po_number,
             "limit_eur": record.limit_eur,
             "responsible_person": record.responsible_person,
+        }
+
+    def verify_after(
+        self,
+        params: dict[str, Any],
+        result: dict[str, Any],
+        state: WorkflowState,
+        invoice_id: str,
+    ) -> VerificationFailure | None:
+        failure = check_not_found(self.name, result)
+        if failure is not None:
+            return failure
+        if result.get("found") and state.invoice_amount_eur is not None:
+            return check_limit_not_exceeded(
+                amount_eur=state.invoice_amount_eur,
+                limit_eur=result["limit_eur"],
+                invoice_id=state.invoice_id if state.invoice_id is not None else invoice_id,
+                po_number=result["po_number"],
+            )
+        return None
+
+    def update_state(
+        self,
+        result: dict[str, Any],
+        state: WorkflowState,
+    ) -> None:
+        if not result.get("found"):
+            return
+        state.po_limit_eur = result["limit_eur"]
+        state.po_responsible_person = result["responsible_person"]
+
+    def compress_result(
+        self,
+        result: dict[str, Any],
+        state: WorkflowState,
+    ) -> dict[str, Any]:
+        if not result.get("found", True):
+            return result
+        return {
+            "status": "materialised_in_state",
+            "tool": self.name,
+            "summary": {"limit_eur": state.po_limit_eur},
         }
