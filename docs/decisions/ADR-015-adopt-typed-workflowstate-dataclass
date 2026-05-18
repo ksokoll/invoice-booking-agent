@@ -1,0 +1,40 @@
+# ADR-015: Adopt typed WorkflowState dataclass
+
+## Status
+
+Accepted
+
+## Context
+
+The Coordinator passed runtime state between its lifecycle methods as
+a dict[str, Any]. Every method that read or wrote state needed to know
+the exact key strings ("invoice_amount_eur", "po_responsible_person",
+"consultations_used", and so on). The contract was implicit. Key typos
+were silent failures. mypy could not help.
+
+## Decision
+
+Replace the dict with a dedicated dataclass, WorkflowState, in
+core/workflow_state.py. Every field is documented as a property of
+the dataclass. Default values handle the "not yet populated" case
+(Optional[X] = None for fetched data; 0 for counters; empty list for
+the approval recipient list; False for the booked flag).
+
+## Consequences
+
+Positive: mypy --strict can verify state access. IDE autocomplete
+guides correct field use. The state contract is documented in one
+file. Migrations of the Coordinator and follow-up refactors (the
+tool lifecycle move) became materially safer.
+
+Negative: state access changes from dict subscript to attribute
+access. A one-time migration touched ~30 lines in pipeline.py. No
+other module needed changes because state lives entirely inside
+Coordinator.run() and its lifecycle methods.
+
+## Alternatives considered
+
+TypedDict was considered. Rejected because it does not support
+default values for non-Required keys cleanly, and because the
+team's mental model of state is closer to "a record with fields"
+than "a dict whose keys happen to be known".
