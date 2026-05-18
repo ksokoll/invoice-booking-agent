@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from app.services.permission_gate import PermissionLevel
-from app.services.tool_base import DefaultTool
-from app.verification.rules import (
+from app.core.verification_rules import (
     check_cost_center_allowed,
     check_not_found,
     check_supplier_active,
 )
+from app.services.permission_gate import PermissionLevel
+from app.services.tool_base import DefaultTool
 
 if TYPE_CHECKING:
     from app.core.entities import SupplierRule

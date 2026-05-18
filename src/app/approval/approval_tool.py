@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from app.core.failures import VerificationFailure
+from app.core.verification_rules import check_approval_consistent
 from app.services.permission_gate import PermissionLevel
 from app.services.tool_base import DefaultTool
-from app.verification.rules import check_approval_consistent
 
 if TYPE_CHECKING:
     from app.core.workflow_state import WorkflowState

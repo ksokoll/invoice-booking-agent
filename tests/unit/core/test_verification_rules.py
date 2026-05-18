@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.verification.rules import (
+from app.core.verification_rules import (
     check_approval_consistent,
     check_approval_required,
     check_budget_sufficient,

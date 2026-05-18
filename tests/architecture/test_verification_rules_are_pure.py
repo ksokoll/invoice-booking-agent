@@ -1,6 +1,6 @@
-"""Fitness Function: verification/rules.py contains pure functions only.
+"""Fitness Function: core/verification_rules.py contains pure functions only.
 
-Verifies that the verification module has no I/O dependencies.
+Verifies that the verification-rules module has no I/O dependencies.
 The Constraint Hierarchy lesson from best_practises.md (Rule #8)
 states that verification belongs in pure Python, not in the LLM
 and not in modules that touch external state.
@@ -49,12 +49,12 @@ _FORBIDDEN_APP_PREFIXES: frozenset[str] = frozenset(
 
 
 def test_verification_rules_module_is_pure() -> None:
-    """verification/rules.py imports nothing that implies I/O or coupling."""
+    """core/verification_rules.py imports nothing that implies I/O or coupling."""
     project_root = Path(__file__).resolve().parents[2]
-    rules_path = project_root / "src" / "app" / "verification" / "rules.py"
+    rules_path = project_root / "src" / "app" / "core" / "verification_rules.py"
 
     assert rules_path.exists(), (
-        f"verification/rules.py not found at {rules_path}. Did the file move?"
+        f"core/verification_rules.py not found at {rules_path}. Did the file move?"
     )
 
     records = parse_imports(rules_path)
@@ -68,7 +68,7 @@ def test_verification_rules_module_is_pure() -> None:
                 if top_level in _FORBIDDEN_TOP_LEVEL:
                     violations.append(
                         f"line {record.line_number}: "
-                        f"import {name} is forbidden in verification/rules.py"
+                        f"import {name} is forbidden in core/verification_rules.py"
                     )
             continue
 
@@ -86,10 +86,10 @@ def test_verification_rules_module_is_pure() -> None:
                 violations.append(
                     f"line {record.line_number}: "
                     f"from {target} import ... is forbidden "
-                    f"(verification/rules.py must not depend on {forbidden_prefix})"
+                    f"(core/verification_rules.py must not depend on {forbidden_prefix})"
                 )
                 break
 
     assert not violations, (
-        "verification/rules.py is not pure. Forbidden imports detected:\n" + "\n".join(violations)
+        "core/verification_rules.py is not pure. Forbidden imports detected:\n" + "\n".join(violations)
     )
