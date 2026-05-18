@@ -279,19 +279,19 @@ class Coordinator:
         )
 
     _STATUS_MAP: ClassVar[dict[str, AgentStatus]] = {
-        "not_found": AgentStatus.BLOCKED_NOT_FOUND,
-        "not_already_booked": AgentStatus.BLOCKED_ALREADY_BOOKED,
-        "approval_consistent": AgentStatus.BLOCKED_CONTRADICTION,
-        "limit_not_exceeded": AgentStatus.BLOCKED_LIMIT_EXCEEDED,
-        "supplier_active": AgentStatus.BLOCKED_SUPPLIER_INACTIVE,
-        "cost_center_allowed": AgentStatus.BLOCKED_COST_CENTER_NOT_ALLOWED,
-        "budget_sufficient": AgentStatus.BLOCKED_BUDGET_INSUFFICIENT,
-        "missing_invoice_state": AgentStatus.BLOCKED_MISSING_INVOICE_STATE,
-        "amount_tampering": AgentStatus.BLOCKED_AMOUNT_TAMPERING,
-        "approval_required": AgentStatus.BLOCKED_APPROVAL_MISSING,
-        "missing_po_data": AgentStatus.BLOCKED_MISSING_PO_DATA,
-        "consultation_limit_exceeded": AgentStatus.BLOCKED_AGENT_ABANDONED,
-    }
+    "not_found": AgentStatus.BLOCKED_NOT_FOUND,
+    "not_already_booked": AgentStatus.BLOCKED_ALREADY_BOOKED,
+    "approval_consistent": AgentStatus.BLOCKED_CONTRADICTION,
+    # limit_not_exceeded removed: consultable, never reaches _failure_to_result
+    "supplier_active": AgentStatus.BLOCKED_SUPPLIER_INACTIVE,
+    "cost_center_allowed": AgentStatus.BLOCKED_COST_CENTER_NOT_ALLOWED,
+    # budget_sufficient removed: consultable, never reaches _failure_to_result
+    "missing_invoice_state": AgentStatus.BLOCKED_MISSING_INVOICE_STATE,
+    "amount_tampering": AgentStatus.BLOCKED_AMOUNT_TAMPERING,
+    "approval_required": AgentStatus.BLOCKED_APPROVAL_MISSING,
+    "missing_po_data": AgentStatus.BLOCKED_MISSING_PO_DATA,
+    "consultation_limit_exceeded": AgentStatus.BLOCKED_AGENT_ABANDONED,
+}
 
     def _failure_to_result(
         self,
