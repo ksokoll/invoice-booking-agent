@@ -91,5 +91,6 @@ def test_verification_rules_module_is_pure() -> None:
                 break
 
     assert not violations, (
-        "core/verification_rules.py is not pure. Forbidden imports detected:\n" + "\n".join(violations)
+        "core/verification_rules.py is not pure. Forbidden imports detected:\n"
+        + "\n".join(violations)
     )
