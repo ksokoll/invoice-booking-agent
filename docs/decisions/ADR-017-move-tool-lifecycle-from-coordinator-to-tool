@@ -1,0 +1,57 @@
+# ADR-017: Move tool lifecycle from Coordinator to Tool
+
+## Status
+
+Accepted
+
+## Context
+
+The Coordinator carried per-tool logic in five methods:
+_pre_execute_verify, _post_execute_verify, _update_state,
+_compress_tool_result, _summarise_for_llm. Each method had a chain
+of `if tool_name == X` branches, one per tool. Adding a new tool
+required edits in all five places. The Coordinator knew the full
+state schema, the verification rules per tool, the state-update
+semantics, and the compression strategy of each tool. This is
+classic shotgun surgery.
+
+## Decision
+
+Extend the Tool protocol with five lifecycle methods:
+verify_before, execute, verify_after, update_state, compress_result.
+A DefaultTool base class provides no-op defaults. Concrete tools
+override only what they need.
+
+The Coordinator's _execute_tool_call becomes a generic dispatch:
+lookup, gate, verify_before, execute, verify_after, update_state,
+compress_result, return ToolResult. No per-tool branches remain.
+The terminal-status decision for escalate_to_human stays in the
+Coordinator (flow control, not tool semantics).
+
+## Consequences
+
+Positive: Coordinator shrinks from 695 to 364 lines. Adding a new
+tool no longer requires Coordinator edits. Each tool is self-
+contained and unit-testable through its lifecycle methods. The 65
+unit tests passed without any modification, confirming that the
+public-API contract is preserved.
+
+Negative: tool classes carry more code than before. The previous
+"tools are dumb data accessors, the Coordinator orchestrates" model
+is replaced by "tools are smart lifecycle units, the Coordinator
+dispatches".
+
+The _STATUS_MAP retains entries for now-unreachable consultable
+rules. Cleanup followed in ADR-XXX (the _STATUS_MAP commit).
+
+## Alternatives considered
+
+A central VerificationOrchestrator class, separate from both the
+Coordinator and the Tools, was considered. Rejected because it would
+have moved the per-tool branching to a new location without
+eliminating it. The Tool-Lifecycle approach genuinely co-locates
+each tool's concerns with the tool itself.
+
+A registry-based hook system (decorators that register verifications
+against tool names) was considered. Rejected because it adds
+indirection. Method overrides on a class are clearer for a reader.

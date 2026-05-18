@@ -5,12 +5,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from app.services.permission_gate import PermissionLevel
+from app.services.tool_base import DefaultTool
+from app.verification.rules import (
+    check_cost_center_allowed,
+    check_not_found,
+    check_supplier_active,
+)
 
 if TYPE_CHECKING:
     from app.core.entities import SupplierRule
+    from app.core.failures import VerificationFailure
+    from app.core.workflow_state import WorkflowState
 
 
-class SupplierRulesTool:
+class SupplierRulesTool(DefaultTool):
     """Fetches booking rules for a specific supplier."""
 
     name = "get_supplier_rules"
@@ -54,4 +62,52 @@ class SupplierRulesTool:
             "approval_threshold_eur": rule.approval_threshold_eur,
             "allowed_cost_centers": rule.allowed_cost_centers,
             "requires_supporting_document": rule.requires_supporting_document,
+        }
+
+    def verify_after(
+        self,
+        params: dict[str, Any],
+        result: dict[str, Any],
+        state: WorkflowState,
+        invoice_id: str,
+    ) -> VerificationFailure | None:
+        failure = check_not_found(self.name, result)
+        if failure is not None:
+            return failure
+        if not result.get("found"):
+            return None
+        failure = check_supplier_active(
+            supplier_id=result["supplier_id"],
+            active=result["active"],
+        )
+        if failure is not None:
+            return failure
+        if state.invoice_cost_center is not None:
+            return check_cost_center_allowed(
+                cost_center=state.invoice_cost_center,
+                allowed_cost_centers=result["allowed_cost_centers"],
+                invoice_id=invoice_id,
+            )
+        return None
+
+    def update_state(
+        self,
+        result: dict[str, Any],
+        state: WorkflowState,
+    ) -> None:
+        if not result.get("found"):
+            return
+        state.supplier_approval_threshold_eur = result["approval_threshold_eur"]
+
+    def compress_result(
+        self,
+        result: dict[str, Any],
+        state: WorkflowState,
+    ) -> dict[str, Any]:
+        if not result.get("found", True):
+            return result
+        return {
+            "status": "materialised_in_state",
+            "tool": self.name,
+            "summary": {"approval_threshold_eur": state.supplier_approval_threshold_eur},
         }

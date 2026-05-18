@@ -5,12 +5,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from app.services.permission_gate import PermissionLevel
+from app.services.tool_base import DefaultTool
+from app.verification.rules import check_limit_not_exceeded, check_not_found
 
 if TYPE_CHECKING:
     from app.core.entities import Invoice
+    from app.core.failures import VerificationFailure
+    from app.core.workflow_state import WorkflowState
 
 
-class InvoiceTool:
+class InvoiceTool(DefaultTool):
     """Fetches invoice details from the invoice system."""
 
     name = "get_invoice_data"
@@ -55,4 +59,56 @@ class InvoiceTool:
             "contact_person": invoice.contact_person,
             "supplier_id": invoice.supplier_id,
             "cost_center": invoice.cost_center,
+        }
+
+    def verify_after(
+        self,
+        params: dict[str, Any],
+        result: dict[str, Any],
+        state: WorkflowState,
+        invoice_id: str,
+    ) -> VerificationFailure | None:
+        failure = check_not_found(self.name, result)
+        if failure is not None:
+            return failure
+        if result.get("found") and state.po_limit_eur is not None:
+            return check_limit_not_exceeded(
+                amount_eur=result["net_amount_eur"],
+                limit_eur=state.po_limit_eur,
+                invoice_id=result["invoice_id"],
+                po_number=result["po_number"],
+            )
+        return None
+
+    def update_state(
+        self,
+        result: dict[str, Any],
+        state: WorkflowState,
+    ) -> None:
+        if not result.get("found"):
+            return
+        state.invoice_id = result["invoice_id"]
+        state.invoice_amount_eur = result["net_amount_eur"]
+        state.invoice_po_number = result["po_number"]
+        state.invoice_contact_person = result.get("contact_person", "")
+        state.invoice_supplier_id = result.get("supplier_id", "")
+        state.invoice_cost_center = result.get("cost_center", "")
+
+    def compress_result(
+        self,
+        result: dict[str, Any],
+        state: WorkflowState,
+    ) -> dict[str, Any]:
+        if not result.get("found", True):
+            return result
+        return {
+            "status": "materialised_in_state",
+            "tool": self.name,
+            "summary": {
+                "invoice_id": state.invoice_id,
+                "amount_eur": state.invoice_amount_eur,
+                "po_number": state.invoice_po_number,
+                "supplier_id": state.invoice_supplier_id,
+                "cost_center": state.invoice_cost_center,
+            },
         }

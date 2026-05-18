@@ -3,6 +3,8 @@
 The Hard/Consultable distinction is the routing key used by the
 Coordinator to decide whether a failure is terminal or whether it
 opens a recovery path through a correspondent (Procurement).
+Each VerificationFailure declares its own consultability at the
+point of construction; the Coordinator inspects the field directly.
 """
 
 from dataclasses import dataclass
@@ -15,18 +17,10 @@ class VerificationFailure:
     Attributes:
         rule: Identifier of the rule that failed.
         reason: Human-readable explanation of the contradiction.
+        consultable: True if the failure may be recoverable through a
+            consultation with Procurement; False if it is terminal.
     """
 
     rule: str
     reason: str
-
-
-# Failure rules that can be recovered through consultation with
-# Procurement. Every other failure rule is treated as hard and
-# terminates the Coordinator loop immediately.
-CONSULTABLE_RULES: frozenset[str] = frozenset(
-    {
-        "limit_not_exceeded",
-        "budget_sufficient",
-    }
-)
+    consultable: bool

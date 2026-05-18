@@ -1,0 +1,47 @@
+# ADR-016: Move consultability from external set to VerificationFailure field
+
+## Status
+
+Accepted
+
+## Context
+
+Each verification rule produced a VerificationFailure with only
+`rule` and `reason`. The classification "is this failure consultable
+(LLM can retry via consult_procurement) or hard (terminate the run)"
+lived in a separate frozenset, CONSULTABLE_RULES, in core/failures.py.
+The Coordinator inspected `failure.rule in CONSULTABLE_RULES` at
+runtime.
+
+This separation created three problems. Adding a new rule required
+edits in two places. The classification was not visible at the
+construction site, only at routing time. Tools that produced their
+own failures (after the Tool-Lifecycle refactor) would need to
+import the global set.
+
+## Decision
+
+Add a `consultable: bool` field to VerificationFailure. Every rule
+function and every inline failure construction sets the field at
+the point of failure creation. The Coordinator routes by reading
+`failure.consultable`.
+
+## Consequences
+
+Positive: classification lives next to the failure data. A reader
+of any check_xxx function sees immediately whether the rule is
+consultable. The Coordinator no longer imports a classification
+table. Tools can construct failures without importing global sets.
+
+Negative: every existing VerificationFailure construction had to be
+updated to include the new keyword argument. The migration touched
+all check_xxx functions plus the four inline constructions in
+pipeline.py.
+
+## Alternatives considered
+
+Enum-typed FailureKind with values HARD and CONSULTABLE was
+considered. Rejected because the two-value distinction is currently
+boolean-shaped and an enum would add ceremony without payoff. If a
+third category emerges, this decision is reversible in one
+migration.

@@ -19,13 +19,13 @@ Architecture:
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from opentelemetry import trace
 
-from app.core.failures import CONSULTABLE_RULES, VerificationFailure
 from app.core.results import CoordinatorResult, ToolCall, ToolResult
 from app.core.statuses import AgentStatus
+from app.core.workflow_state import WorkflowState
 from app.prompts import SYSTEM_PROMPT
 from app.services.observability import (
     get_logger,
@@ -40,19 +40,9 @@ from app.services.observability import (
 )
 from app.services.observability.decorators import traced
 from app.services.permission_gate import PermissionDeniedError, PermissionGate
-from app.verification.rules import (
-    APPROVAL_THRESHOLD_EUR,
-    check_approval_consistent,
-    check_approval_required,
-    check_budget_sufficient,
-    check_cost_center_allowed,
-    check_limit_not_exceeded,
-    check_not_already_booked,
-    check_not_found,
-    check_supplier_active,
-)
 
 if TYPE_CHECKING:
+    from app.core.failures import VerificationFailure
     from app.services.llm.client_protocol import LLMClient
     from app.services.tool_base import Tool
 
@@ -60,10 +50,6 @@ logger = get_logger(__name__)
 tracer = get_tracer(__name__)
 
 _MAX_ITERATIONS = 10
-# Consultation budget per invoice. Lifecycle-separated from
-# CONSULTABLE_RULES in core/failures.py (classification vs
-# enforcement; see ADR-006).
-_MAX_CONSULTATIONS_PER_INVOICE = 3
 
 
 class Coordinator:
@@ -98,7 +84,7 @@ class Coordinator:
         cid = new_correlation_id()
         set_correlation_id(cid)
 
-        state: dict[str, Any] = {}
+        state = WorkflowState()
         record_run_started()
 
         run_span = trace.get_current_span()
@@ -110,10 +96,18 @@ class Coordinator:
             task=task,
         )
 
+        # Initial LLM call: no tool results yet, so we use start() instead of
+        # continue_with_results(). Tracing is covered by the parent
+        # coordinator.run span. The single-turn protocol is documented in ADR-003.
         response = self._client.start(
             system_prompt=self._system_prompt,
             task=task,
             tool_schemas=self._tool_schemas,
+        )
+        logger.info(
+            "coordinator.initial_call",
+            stop_reason=response.stop_reason,
+            tool_calls_count=len(response.tool_calls),
         )
 
         for iteration in range(_MAX_ITERATIONS):
@@ -130,7 +124,7 @@ class Coordinator:
                 if response.stop_reason == "end_turn":
                     status = (
                         AgentStatus.BOOKED
-                        if state.get("booked")
+                        if state.booked
                         else AgentStatus.BLOCKED_AGENT_ABANDONED
                     )
                     result = CoordinatorResult(
@@ -170,7 +164,7 @@ class Coordinator:
     def _execute_tool_call(
         self,
         tool_call: ToolCall,
-        state: dict[str, Any],
+        state: WorkflowState,
         invoice_id: str,
     ) -> ToolResult | CoordinatorResult:
         """Run one tool call through the gate, execute, and verify.
@@ -182,11 +176,11 @@ class Coordinator:
 
         Args:
             tool_call: The LLM-issued tool call to execute.
-            state: Mutable accumulated state for the current run. Keys
-                written by earlier tools (for example
-                `invoice_amount_eur` from `get_invoice_data`) are read
-                here, and this method may add further keys via
-                `_update_state`.
+            state: Mutable accumulated state for the current run.
+                Fields written by earlier tools (for example
+                `invoice_amount_eur` from `get_invoice_data`) are
+                read here, and the tool's own `update_state` may
+                add further fields.
             invoice_id: The invoice being booked. Flows into span
                 attributes and failure messages.
 
@@ -227,16 +221,16 @@ class Coordinator:
                 invoice_id=invoice_id,
             )
 
-        # --- Pre-Execute Verification ---
+        # --- Pre-Execute Verification (delegated to the tool) ---
         with tracer.start_as_current_span("verification.pre_execute") as verif_span:
             verif_span.set_attribute("tool_name", tool_call.name)
-            pre_failure = self._pre_execute_verify(tool_call, state, invoice_id)
+            pre_failure = tool.verify_before(tool_call.params, state, invoice_id)
             if pre_failure is not None:
                 verif_span.set_attribute("rule", pre_failure.rule)
                 verif_span.set_attribute("outcome", "failed")
                 record_verification_failure(
                     rule=pre_failure.rule,
-                    consultable=pre_failure.rule in CONSULTABLE_RULES,
+                    consultable=pre_failure.consultable,
                 )
                 return self._route_failure(pre_failure, tool_call, invoice_id)
 
@@ -249,6 +243,10 @@ class Coordinator:
         )
 
         # --- Escalation hook ---
+        # The terminal-status decision for escalate_to_human is a genuine
+        # Coordinator concern (flow control), not a per-tool concern. It
+        # stays here intentionally and is the only tool name the
+        # Coordinator still knows by string.
         if tool_call.name == "escalate_to_human":
             span.set_attribute("outcome", "escalated")
             record_tool_call(tool_call.name, "escalated")
@@ -258,127 +256,42 @@ class Coordinator:
                 invoice_id=invoice_id,
             )
 
-        # --- Post-Execute Verification ---
+        # --- Post-Execute Verification (delegated to the tool) ---
         with tracer.start_as_current_span("verification.post_execute") as verif_span:
             verif_span.set_attribute("tool_name", tool_call.name)
-            post_failure = self._post_execute_verify(tool_call, raw_result, state, invoice_id)
+            post_failure = tool.verify_after(tool_call.params, raw_result, state, invoice_id)
             if post_failure is not None:
                 verif_span.set_attribute("rule", post_failure.rule)
                 verif_span.set_attribute("outcome", "failed")
                 record_verification_failure(
                     rule=post_failure.rule,
-                    consultable=post_failure.rule in CONSULTABLE_RULES,
+                    consultable=post_failure.consultable,
                 )
                 return self._route_failure(post_failure, tool_call, invoice_id)
 
-        # --- Increment consultation counter ---
-        if tool_call.name == "consult_procurement":
-            state["consultations_used"] = state.get("consultations_used", 0) + 1
-
-        self._update_state(tool_call.name, raw_result, state)
+        tool.update_state(raw_result, state)
         span.set_attribute("outcome", "ok")
         record_tool_call(tool_call.name, "ok")
 
         return ToolResult(
             tool_call_id=tool_call.id,
-            content=self._compress_tool_result(tool_call.name, raw_result, state),
+            content=json.dumps(tool.compress_result(raw_result, state)),
         )
 
-    _COMPRESSIBLE_TOOLS: frozenset[str] = frozenset(
-        {
-            "get_invoice_data",
-            "get_supplier_rules",
-            "get_po_limit",
-            "get_budget",
-        }
-    )
-
-    def _compress_tool_result(
-        self,
-        tool_name: str,
-        raw_result: dict[str, Any],
-        state: dict[str, Any],
-    ) -> str:
-        """Return the LLM-facing payload for a tool result.
-
-        Read-tool results can be bulky (full invoice records,
-        supplier rules, PO limits). Sending them verbatim back into
-        the LLM context wastes tokens and tends to confuse the
-        model, because the same fields reappear on every iteration.
-        The Coordinator already materialises the relevant fields
-        into `state`, so the LLM does not need to see the raw
-        payload a second time.
-
-        For tools in `_COMPRESSIBLE_TOOLS` whose lookup succeeded
-        (`found` is truthy), this method replaces the full payload
-        with a small pointer object that names the tool, marks the
-        data as materialised in state, and embeds a short summary of
-        the key fields from state. All other tool results (write
-        tools, not-found lookups, and any tool not in
-        `_COMPRESSIBLE_TOOLS`) pass through unchanged.
-
-        Args:
-            tool_name: The tool whose result is being compressed.
-            raw_result: The tool's full result dict.
-            state: The accumulated state for this run, used to pull
-                the fields that go into the summary.
-
-        Returns:
-            A JSON string that the Coordinator places on the outgoing
-            `ToolResult`. Either the pointer object (for compressed
-            read-tool results) or a direct dump of `raw_result`.
-        """
-        if tool_name not in self._COMPRESSIBLE_TOOLS:
-            return json.dumps(raw_result)
-
-        if not raw_result.get("found", True):
-            return json.dumps(raw_result)
-
-        pointer = {
-            "status": "materialised_in_state",
-            "tool": tool_name,
-            "summary": self._summarise_for_llm(tool_name, state),
-        }
-        return json.dumps(pointer)
-
-    def _summarise_for_llm(
-        self,
-        tool_name: str,
-        state: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Build a short summary of the materialised state for one tool."""
-        if tool_name == "get_invoice_data":
-            return {
-                "invoice_id": state.get("invoice_id"),
-                "amount_eur": state.get("invoice_amount_eur"),
-                "po_number": state.get("invoice_po_number"),
-                "supplier_id": state.get("invoice_supplier_id"),
-                "cost_center": state.get("invoice_cost_center"),
-            }
-        if tool_name == "get_supplier_rules":
-            return {
-                "approval_threshold_eur": state.get("supplier_approval_threshold_eur"),
-            }
-        if tool_name == "get_po_limit":
-            return {"limit_eur": state.get("po_limit_eur")}
-        if tool_name == "get_budget":
-            return {"remaining_eur": state.get("budget_remaining_eur")}
-        return {}
-
     _STATUS_MAP: ClassVar[dict[str, AgentStatus]] = {
-        "not_found": AgentStatus.BLOCKED_NOT_FOUND,
-        "not_already_booked": AgentStatus.BLOCKED_ALREADY_BOOKED,
-        "approval_consistent": AgentStatus.BLOCKED_CONTRADICTION,
-        "limit_not_exceeded": AgentStatus.BLOCKED_LIMIT_EXCEEDED,
-        "supplier_active": AgentStatus.BLOCKED_SUPPLIER_INACTIVE,
-        "cost_center_allowed": AgentStatus.BLOCKED_COST_CENTER_NOT_ALLOWED,
-        "budget_sufficient": AgentStatus.BLOCKED_BUDGET_INSUFFICIENT,
-        "missing_invoice_state": AgentStatus.BLOCKED_MISSING_INVOICE_STATE,
-        "amount_tampering": AgentStatus.BLOCKED_AMOUNT_TAMPERING,
-        "approval_required": AgentStatus.BLOCKED_APPROVAL_MISSING,
-        "missing_po_data": AgentStatus.BLOCKED_MISSING_PO_DATA,
-        "consultation_limit_exceeded": AgentStatus.BLOCKED_AGENT_ABANDONED,
-    }
+    "not_found": AgentStatus.BLOCKED_NOT_FOUND,
+    "not_already_booked": AgentStatus.BLOCKED_ALREADY_BOOKED,
+    "approval_consistent": AgentStatus.BLOCKED_CONTRADICTION,
+    # limit_not_exceeded removed: consultable, never reaches _failure_to_result
+    "supplier_active": AgentStatus.BLOCKED_SUPPLIER_INACTIVE,
+    "cost_center_allowed": AgentStatus.BLOCKED_COST_CENTER_NOT_ALLOWED,
+    # budget_sufficient removed: consultable, never reaches _failure_to_result
+    "missing_invoice_state": AgentStatus.BLOCKED_MISSING_INVOICE_STATE,
+    "amount_tampering": AgentStatus.BLOCKED_AMOUNT_TAMPERING,
+    "approval_required": AgentStatus.BLOCKED_APPROVAL_MISSING,
+    "missing_po_data": AgentStatus.BLOCKED_MISSING_PO_DATA,
+    "consultation_limit_exceeded": AgentStatus.BLOCKED_AGENT_ABANDONED,
+}
 
     def _failure_to_result(
         self,
@@ -406,13 +319,13 @@ class Coordinator:
     ) -> ToolResult | CoordinatorResult:
         """Route a verification failure based on its consultability.
 
-        The `CONSULTABLE_RULES` frozenset (see ADR-006) partitions
-        verification rules into two classes. Consultable failures
-        are returned to the LLM as a tool-error payload so the agent
-        can call `consult_procurement` and potentially recover; the
-        run continues. Hard failures terminate the run with a
-        mapped `CoordinatorResult` status and never reach the LLM
-        again.
+        Each `VerificationFailure` carries a `consultable` flag (see
+        ADR-006) that partitions rules into two classes. Consultable
+        failures are returned to the LLM as a tool-error payload so
+        the agent can call `consult_procurement` and potentially
+        recover; the run continues. Hard failures terminate the run
+        with a mapped `CoordinatorResult` status and never reach the
+        LLM again.
 
         Args:
             failure: The `VerificationFailure` produced by either
@@ -430,7 +343,7 @@ class Coordinator:
             when the rule is consultable, or a terminal
             `CoordinatorResult` when the rule is hard.
         """
-        if failure.rule in CONSULTABLE_RULES:
+        if failure.consultable:
             payload = {
                 "verification_failed": True,
                 "rule": failure.rule,
@@ -449,297 +362,3 @@ class Coordinator:
             )
         return self._failure_to_result(failure, invoice_id)
 
-    def _pre_execute_verify(
-        self,
-        tool_call: ToolCall,
-        state: dict[str, Any],
-        invoice_id: str,
-    ) -> Any:
-        """Run checks that must fire before the tool executes.
-
-        Pre-execute checks guard against three categories:
-
-        1. Budgeted resources: `consult_procurement` has a per-
-           invoice limit (`_MAX_CONSULTATIONS_PER_INVOICE`). Once
-           reached, further consultations are refused as a hard
-           failure so the agent must escalate.
-        2. Coordinator-managed parameters: `request_approval` needs
-           a recipient. The recipient is deterministic from the
-           prior `get_po_limit` call (see ADR-005). If that call
-           has not been made, the tool call is refused; otherwise
-           the recipient is injected into the tool call params.
-        3. Confused-deputy guards on `book_invoice`: the invoice
-           amount must have been fetched (no booking on phantom
-           state), the LLM-supplied amount must match the recorded
-           amount (no tampering), and the invoice must not already
-           be booked; above the approval threshold, approval must
-           have been recorded.
-
-        Args:
-            tool_call: The tool call about to execute. The method
-                may mutate its `params` dict for the
-                Coordinator-managed-parameter case.
-            state: Accumulated state for this run. Used for every
-                check above.
-            invoice_id: The invoice being booked; surfaced in
-                failure reasons.
-
-        Returns:
-            `None` when the tool call is allowed to proceed. A
-            `VerificationFailure` when a guard fires; the rule name
-            identifies which guard.
-        """
-        if tool_call.name == "consult_procurement":
-            used = state.get("consultations_used", 0)
-            if used >= _MAX_CONSULTATIONS_PER_INVOICE:
-                return VerificationFailure(
-                    rule="consultation_limit_exceeded",
-                    reason=(
-                        f"Maximum {_MAX_CONSULTATIONS_PER_INVOICE} consultations "
-                        f"per invoice reached for invoice {invoice_id}. "
-                        f"Escalate to human instead."
-                    ),
-                )
-            return None
-
-        if tool_call.name == "request_approval":
-            state_recipient = state.get("po_responsible_person")
-            if state_recipient is None:
-                return VerificationFailure(
-                    rule="missing_po_data",
-                    reason=(
-                        f"Cannot request approval for invoice {invoice_id}: "
-                        f"get_po_limit has not been called yet, so the "
-                        f"authoritative recipient is unknown. The agent "
-                        f"must call get_po_limit before request_approval."
-                    ),
-                )
-            # Coordinator-managed parameter injection per ADR-005:
-            # the recipient is determined by the system from authoritative
-            # state, never by the LLM. ToolCall.params is the documented
-            # extension point for this injection (mutable dict on a frozen
-            # dataclass).
-            tool_call.params["recipient"] = state_recipient
-            return None
-
-        if tool_call.name != "book_invoice":
-            return None
-
-        params = tool_call.params
-
-        state_amount = state.get("invoice_amount_eur")
-        if state_amount is None:
-            return VerificationFailure(
-                rule="missing_invoice_state",
-                reason=(
-                    f"Cannot book invoice {invoice_id}: invoice data was never "
-                    f"fetched. The agent must call get_invoice_data before "
-                    f"book_invoice."
-                ),
-            )
-
-        params_amount = params.get("amount_eur")
-        if params_amount is not None and abs(params_amount - state_amount) > 0.001:
-            return VerificationFailure(
-                rule="amount_tampering",
-                reason=(
-                    f"Invoice {invoice_id}: book_invoice was called with "
-                    f"amount_eur={params_amount} but the authoritative amount "
-                    f"from get_invoice_data is {state_amount}. Refusing to book."
-                ),
-            )
-
-        authoritative_amount = state_amount
-
-        failure = check_not_already_booked(
-            invoice_id=invoice_id,
-            booked_invoices=self._booked_invoices,
-        )
-        if failure:
-            return failure
-
-        failure = check_approval_required(
-            invoice_id=invoice_id,
-            amount_eur=authoritative_amount,
-            approval_received=bool(state.get("approvals_received")),
-            threshold_eur=state.get("supplier_approval_threshold_eur", APPROVAL_THRESHOLD_EUR),
-        )
-        if failure:
-            return failure
-
-        return None
-
-    def _post_execute_verify(
-        self,
-        tool_call: ToolCall,
-        result: dict[str, Any],
-        state: dict[str, Any],
-        invoice_id: str,
-    ) -> Any:
-        """Run checks that require the tool result.
-
-        Post-execute checks apply the pure verification rules from
-        `app.verification.rules` to the combination of the tool
-        result and the accumulated state. The checks are ordered:
-
-        1. `not_found` for the four SAP lookup tools.
-        2. `limit_not_exceeded` whenever both amount and limit are
-           known; the check fires from either direction depending on
-           which of `get_po_limit` and `get_invoice_data` was
-           called first.
-        3. Supplier rules: `supplier_active` and, when the invoice
-           cost center is already known, `cost_center_allowed`.
-        4. `budget_sufficient` when both amount and budget are
-           known.
-        5. `approval_consistent` on `request_approval` results.
-           This check also records the recipient in
-           `state["approvals_received"]` when the approval was
-           granted, so the subsequent `approval_required` check on
-           `book_invoice` can see it.
-
-        Args:
-            tool_call: The tool call that just executed.
-            result: The raw result dict returned by the tool.
-            state: Accumulated state; read for cross-tool
-                invariants and updated with the approval list when
-                appropriate.
-            invoice_id: The invoice being booked; surfaced in
-                failure reasons.
-
-        Returns:
-            `None` when every applicable check passed. The first
-            `VerificationFailure` encountered otherwise.
-        """
-        tool_name = tool_call.name
-        params = tool_call.params
-
-        # 1. Not-found check.
-        if tool_name in (
-            "get_invoice_data",
-            "get_po_limit",
-            "get_supplier_rules",
-            "get_budget",
-        ):
-            failure = check_not_found(tool_name, result)
-            if failure:
-                return failure
-
-        # 2. Limit check.
-        if tool_name == "get_po_limit" and result.get("found") and "invoice_amount_eur" in state:
-            failure = check_limit_not_exceeded(
-                amount_eur=state["invoice_amount_eur"],
-                limit_eur=result["limit_eur"],
-                invoice_id=state.get("invoice_id", invoice_id),
-                po_number=result["po_number"],
-            )
-            if failure:
-                return failure
-
-        if tool_name == "get_invoice_data" and result.get("found") and "po_limit_eur" in state:
-            failure = check_limit_not_exceeded(
-                amount_eur=result["net_amount_eur"],
-                limit_eur=state["po_limit_eur"],
-                invoice_id=result["invoice_id"],
-                po_number=result["po_number"],
-            )
-            if failure:
-                return failure
-
-        # 3. Supplier-rules checks.
-        if tool_name == "get_supplier_rules" and result.get("found"):
-            failure = check_supplier_active(
-                supplier_id=result["supplier_id"],
-                active=result["active"],
-            )
-            if failure:
-                return failure
-            if "invoice_cost_center" in state:
-                failure = check_cost_center_allowed(
-                    cost_center=state["invoice_cost_center"],
-                    allowed_cost_centers=result["allowed_cost_centers"],
-                    invoice_id=invoice_id,
-                )
-                if failure:
-                    return failure
-
-        # 4. Budget check.
-        if tool_name == "get_budget" and result.get("found") and "invoice_amount_eur" in state:
-            failure = check_budget_sufficient(
-                amount_eur=state["invoice_amount_eur"],
-                remaining_budget_eur=result["remaining_eur"],
-                cost_center=result["cost_center"],
-                invoice_id=invoice_id,
-            )
-            if failure:
-                return failure
-
-        # 5. Approval contradiction check.
-        if tool_name == "request_approval":
-            if "invoice_amount_eur" in state and "po_limit_eur" in state:
-                failure = check_approval_consistent(
-                    approved=result["approved"],
-                    stated_reason=result["reason"],
-                    expected_limit_eur=state["po_limit_eur"],
-                    actual_amount_eur=state["invoice_amount_eur"],
-                    recipient=params["recipient"],
-                )
-                if failure:
-                    return failure
-            if result.get("approved"):
-                approvals: list[str] = state.setdefault("approvals_received", [])
-                approvals.append(params["recipient"])
-
-        return None
-
-    def _update_state(
-        self,
-        tool_name: str,
-        result: dict[str, Any],
-        state: dict[str, Any],
-    ) -> None:
-        """Update accumulated state after a successful tool call.
-
-        Each successful read tool contributes a known set of fields
-        to `state`. Subsequent verification checks and the
-        `_summarise_for_llm` helper read from those fields, so the
-        contract is stable per tool:
-
-        - `get_invoice_data` (found): writes `invoice_id`,
-          `invoice_amount_eur`, `invoice_po_number`,
-          `invoice_contact_person`, `invoice_supplier_id`,
-          `invoice_cost_center`.
-        - `get_supplier_rules` (found): writes
-          `supplier_approval_threshold_eur`.
-        - `get_budget` (found): writes `budget_remaining_eur`.
-        - `get_po_limit` (found): writes `po_limit_eur` and
-          `po_responsible_person`. The latter is the Coordinator-
-          managed recipient for `request_approval` (see ADR-005).
-        - `book_invoice` (booked): writes `booked=True`, which
-          determines the terminal status in `run`.
-
-        Args:
-            tool_name: The tool whose result is being folded into
-                state.
-            result: The tool's raw result dict.
-            state: The mutable state dict for this run.
-        """
-        if tool_name == "get_invoice_data" and result.get("found"):
-            state["invoice_id"] = result["invoice_id"]
-            state["invoice_amount_eur"] = result["net_amount_eur"]
-            state["invoice_po_number"] = result["po_number"]
-            state["invoice_contact_person"] = result.get("contact_person", "")
-            state["invoice_supplier_id"] = result.get("supplier_id", "")
-            state["invoice_cost_center"] = result.get("cost_center", "")
-
-        if tool_name == "get_supplier_rules" and result.get("found"):
-            state["supplier_approval_threshold_eur"] = result["approval_threshold_eur"]
-
-        if tool_name == "get_budget" and result.get("found"):
-            state["budget_remaining_eur"] = result["remaining_eur"]
-
-        if tool_name == "get_po_limit" and result.get("found"):
-            state["po_limit_eur"] = result["limit_eur"]
-            state["po_responsible_person"] = result["responsible_person"]
-
-        if tool_name == "book_invoice" and result.get("booked"):
-            state["booked"] = True
