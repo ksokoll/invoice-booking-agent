@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from opentelemetry import trace
 
-from app.core.failures import VerificationFailure
 from app.core.results import CoordinatorResult, ToolCall, ToolResult
 from app.core.statuses import AgentStatus
 from app.core.workflow_state import WorkflowState
@@ -41,14 +40,9 @@ from app.services.observability import (
 )
 from app.services.observability.decorators import traced
 from app.services.permission_gate import PermissionDeniedError, PermissionGate
-from app.verification.rules import (
-    APPROVAL_THRESHOLD_EUR,
-    check_approval_consistent,
-    check_approval_required,
-    check_not_already_booked,
-)
 
 if TYPE_CHECKING:
+    from app.core.failures import VerificationFailure
     from app.services.llm.client_protocol import LLMClient
     from app.services.tool_base import Tool
 
@@ -56,10 +50,6 @@ logger = get_logger(__name__)
 tracer = get_tracer(__name__)
 
 _MAX_ITERATIONS = 10
-# Consultation budget per invoice. Lifecycle-separated from the
-# per-failure consultable flag on VerificationFailure (classification
-# vs enforcement; see ADR-006).
-_MAX_CONSULTATIONS_PER_INVOICE = 3
 
 
 class Coordinator:
@@ -283,10 +273,6 @@ class Coordinator:
                 )
                 return self._route_failure(post_failure, tool_call, invoice_id)
 
-        # --- Increment consultation counter ---
-        if tool_call.name == "consult_procurement":
-            state.consultations_used += 1
-
         # State update: tool-side first (no-op for non-migrated tools), then
         # Coordinator's legacy branches for the tools still living here.
         tool.update_state(raw_result, state)
@@ -493,93 +479,10 @@ class Coordinator:
             `VerificationFailure` when a guard fires; the rule name
             identifies which guard.
         """
-        if tool_call.name == "consult_procurement":
-            used = state.consultations_used
-            if used >= _MAX_CONSULTATIONS_PER_INVOICE:
-                return VerificationFailure(
-                    rule="consultation_limit_exceeded",
-                    reason=(
-                        f"Maximum {_MAX_CONSULTATIONS_PER_INVOICE} consultations "
-                        f"per invoice reached for invoice {invoice_id}. "
-                        f"Escalate to human instead."
-                    ),
-                    consultable=False,
-                )
-            return None
-
-        if tool_call.name == "request_approval":
-            state_recipient = state.po_responsible_person
-            if state_recipient is None:
-                return VerificationFailure(
-                    rule="missing_po_data",
-                    reason=(
-                        f"Cannot request approval for invoice {invoice_id}: "
-                        f"get_po_limit has not been called yet, so the "
-                        f"authoritative recipient is unknown. The agent "
-                        f"must call get_po_limit before request_approval."
-                    ),
-                    consultable=False,
-                )
-            # Coordinator-managed parameter injection per ADR-005:
-            # the recipient is determined by the system from authoritative
-            # state, never by the LLM. ToolCall.params is the documented
-            # extension point for this injection (mutable dict on a frozen
-            # dataclass).
-            tool_call.params["recipient"] = state_recipient
-            return None
-
-        # Early Exit if "book invoice" wasn't chosen
-        if tool_call.name != "book_invoice":
-            return None
-
-        params = tool_call.params
-
-        state_amount = state.invoice_amount_eur
-        if state_amount is None:
-            return VerificationFailure(
-                rule="missing_invoice_state",
-                reason=(
-                    f"Cannot book invoice {invoice_id}: invoice data was never "
-                    f"fetched. The agent must call get_invoice_data before "
-                    f"book_invoice."
-                ),
-                consultable=False,
-            )
-
-        params_amount = params.get("amount_eur")
-        if params_amount is not None and abs(params_amount - state_amount) > 0.001:
-            return VerificationFailure(
-                rule="amount_tampering",
-                reason=(
-                    f"Invoice {invoice_id}: book_invoice was called with "
-                    f"amount_eur={params_amount} but the authoritative amount "
-                    f"from get_invoice_data is {state_amount}. Refusing to book."
-                ),
-                consultable=False,
-            )
-
-        authoritative_amount = state_amount
-
-        failure = check_not_already_booked(
-            invoice_id=invoice_id,
-            booked_invoices=self._booked_invoices,
-        )
-        if failure:
-            return failure
-
-        failure = check_approval_required(
-            invoice_id=invoice_id,
-            amount_eur=authoritative_amount,
-            approval_received=bool(state.approvals_received),
-            threshold_eur=(
-                state.supplier_approval_threshold_eur
-                if state.supplier_approval_threshold_eur is not None
-                else APPROVAL_THRESHOLD_EUR
-            ),
-        )
-        if failure:
-            return failure
-
+        # All pre-execute guards now live on the tools themselves
+        # (BookingTool, ApprovalTool, ConsultProcurementTool). This
+        # method is retained as a no-op fallback until the final
+        # cleanup commit removes it.
         return None
 
     def _post_execute_verify(
@@ -623,27 +526,10 @@ class Coordinator:
             `None` when every applicable check passed. The first
             `VerificationFailure` encountered otherwise.
         """
-        tool_name = tool_call.name
-        params = tool_call.params
-
-        # SAP read-tool checks (not_found, limit, supplier rules, budget)
-        # moved into each tool's verify_after.
-
-        # 5. Approval contradiction check.
-        if tool_name == "request_approval":
-            if state.invoice_amount_eur is not None and state.po_limit_eur is not None:
-                failure = check_approval_consistent(
-                    approved=result["approved"],
-                    stated_reason=result["reason"],
-                    expected_limit_eur=state.po_limit_eur,
-                    actual_amount_eur=state.invoice_amount_eur,
-                    recipient=params["recipient"],
-                )
-                if failure:
-                    return failure
-            if result.get("approved"):
-                state.approvals_received.append(params["recipient"])
-
+        # All post-execute checks now live on the tools themselves
+        # (InvoiceTool, POTool, SupplierRulesTool, BudgetTool,
+        # ApprovalTool). Retained as a no-op fallback until the
+        # final cleanup commit removes it.
         return None
 
     def _update_state(
@@ -678,8 +564,7 @@ class Coordinator:
             result: The tool's raw result dict.
             state: The mutable WorkflowState for this run.
         """
-        # All SAP read-tool state updates moved into each tool's
-        # update_state. book_invoice remains here until BookingTool is
-        # migrated in the next commit.
-        if tool_name == "book_invoice" and result.get("booked"):
-            state.booked = True
+        # All state updates now live on the tools themselves.
+        # Retained as a no-op fallback until the final cleanup commit
+        # removes it.
+        return None

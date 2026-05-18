@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
+from app.core.failures import VerificationFailure
 from app.services.permission_gate import PermissionLevel
 from app.services.tool_base import DefaultTool
+
+if TYPE_CHECKING:
+    from app.core.workflow_state import WorkflowState
+
+# Per-invoice consultation budget. Once reached, further consultations
+# are refused as a hard failure and the agent must escalate.
+_MAX_CONSULTATIONS_PER_INVOICE = 3
 
 
 class ConsultProcurementTool(DefaultTool):
@@ -102,3 +110,28 @@ class ConsultProcurementTool(DefaultTool):
             "invoice_id": invoice_id,
             "response": response_text,
         }
+
+    def verify_before(
+        self,
+        params: dict[str, Any],
+        state: WorkflowState,
+        invoice_id: str,
+    ) -> VerificationFailure | None:
+        if state.consultations_used >= _MAX_CONSULTATIONS_PER_INVOICE:
+            return VerificationFailure(
+                rule="consultation_limit_exceeded",
+                reason=(
+                    f"Maximum {_MAX_CONSULTATIONS_PER_INVOICE} consultations "
+                    f"per invoice reached for invoice {invoice_id}. "
+                    f"Escalate to human instead."
+                ),
+                consultable=False,
+            )
+        return None
+
+    def update_state(
+        self,
+        result: dict[str, Any],
+        state: WorkflowState,
+    ) -> None:
+        state.consultations_used += 1

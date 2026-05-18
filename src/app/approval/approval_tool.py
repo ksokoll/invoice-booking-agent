@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
+from app.core.failures import VerificationFailure
 from app.services.permission_gate import PermissionLevel
 from app.services.tool_base import DefaultTool
+from app.verification.rules import check_approval_consistent
+
+if TYPE_CHECKING:
+    from app.core.workflow_state import WorkflowState
 
 
 class ApprovalTool(DefaultTool):
@@ -67,3 +72,52 @@ class ApprovalTool(DefaultTool):
             "approved": approved,
             "reason": reason,
         }
+
+    def verify_before(
+        self,
+        params: dict[str, Any],
+        state: WorkflowState,
+        invoice_id: str,
+    ) -> VerificationFailure | None:
+        state_recipient = state.po_responsible_person
+        if state_recipient is None:
+            return VerificationFailure(
+                rule="missing_po_data",
+                reason=(
+                    f"Cannot request approval for invoice {invoice_id}: "
+                    f"get_po_limit has not been called yet, so the "
+                    f"authoritative recipient is unknown. The agent "
+                    f"must call get_po_limit before request_approval."
+                ),
+                consultable=False,
+            )
+        # Coordinator-managed parameter injection per ADR-005: the recipient
+        # is determined by the system from authoritative state, never by
+        # the LLM. ToolCall.params is the documented extension point for
+        # this injection (mutable dict on a frozen dataclass).
+        params["recipient"] = state_recipient
+        return None
+
+    def verify_after(
+        self,
+        params: dict[str, Any],
+        result: dict[str, Any],
+        state: WorkflowState,
+        invoice_id: str,
+    ) -> VerificationFailure | None:
+        # Option A (per CLAUDE.md): the approvals_received append is kept
+        # co-located with the contradiction check because both depend on
+        # the same params["recipient"], which verify_before just injected.
+        if state.invoice_amount_eur is not None and state.po_limit_eur is not None:
+            failure = check_approval_consistent(
+                approved=result["approved"],
+                stated_reason=result["reason"],
+                expected_limit_eur=state.po_limit_eur,
+                actual_amount_eur=state.invoice_amount_eur,
+                recipient=params["recipient"],
+            )
+            if failure is not None:
+                return failure
+        if result.get("approved"):
+            state.approvals_received.append(params["recipient"])
+        return None
