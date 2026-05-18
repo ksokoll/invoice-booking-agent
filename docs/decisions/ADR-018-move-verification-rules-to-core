@@ -1,0 +1,61 @@
+# ADR-018: Move verification rules to core (Shared Kernel)
+
+## Status
+
+Accepted
+
+## Context
+
+After the Tool-Lifecycle refactor (ADR-017), every concrete tool
+implements its own verify_before / verify_after by calling the pure
+check_xxx functions in app.verification.rules. As a result, tools
+from intake, approval, and booking all import from the verification
+bounded context. This violates the cross-context independence rule
+established in ADR-007 and surfaced as a failure of the
+test_bounded_contexts_do_not_import_from_each_other fitness function.
+
+The verification rules themselves are not specific to the verification
+bounded context. They are pure domain functions: no I/O, no state, no
+context-specific knowledge. Every bounded context consumes them. They
+are a Shared Kernel concept (DDD), and the project already has a home
+for that: app.core.
+
+## Decision
+
+Move src/app/verification/rules.py to src/app/core/verification_rules.py
+and update every importer accordingly. The check_xxx function names and
+signatures stay unchanged.
+
+The verification bounded context retains POTool and BudgetTool. It is
+no longer the owner of the rule library; it is now just another consumer.
+
+## Consequences
+
+Positive: cross-context independence (ADR-007) is restored. The rule
+library lives where its dependency shape says it should: in the Shared
+Kernel, depended on by every context, depending on no context. The
+fitness function passes. Adding a new bounded context that needs to
+call verification rules no longer requires importing from another
+context.
+
+Negative: the verification/ directory's name is now slightly misleading
+- it still hosts the two verification-phase tools (PO, Budget) but no
+longer the rules themselves. The directory is kept under its current
+name because renaming a bounded context is a larger concern with its
+own ADR.
+
+The architecture fitness function test_verification_rules_module_is_pure
+was updated to point at the new path; this is a test-side path edit, not
+a semantic change.
+
+## Alternatives considered
+
+Special-casing the fitness function to allow imports from
+app.verification.rules across contexts was considered. Rejected because
+it would weaken the cross-context independence principle for the sake
+of preserving a file location. The principle is more valuable than the
+location.
+
+Duplicating the rule functions per bounded context was considered.
+Rejected as it would introduce drift risk for what are intentionally
+single-source-of-truth domain rules (ADR-004).
