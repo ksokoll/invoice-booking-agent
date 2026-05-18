@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from opentelemetry import trace
 
-from app.core.failures import CONSULTABLE_RULES, VerificationFailure
+from app.core.failures import VerificationFailure
 from app.core.results import CoordinatorResult, ToolCall, ToolResult
 from app.core.statuses import AgentStatus
 from app.core.workflow_state import WorkflowState
@@ -61,9 +61,9 @@ logger = get_logger(__name__)
 tracer = get_tracer(__name__)
 
 _MAX_ITERATIONS = 10
-# Consultation budget per invoice. Lifecycle-separated from
-# CONSULTABLE_RULES in core/failures.py (classification vs
-# enforcement; see ADR-006).
+# Consultation budget per invoice. Lifecycle-separated from the
+# per-failure consultable flag on VerificationFailure (classification
+# vs enforcement; see ADR-006).
 _MAX_CONSULTATIONS_PER_INVOICE = 3
 
 
@@ -245,7 +245,7 @@ class Coordinator:
                 verif_span.set_attribute("outcome", "failed")
                 record_verification_failure(
                     rule=pre_failure.rule,
-                    consultable=pre_failure.rule in CONSULTABLE_RULES,
+                    consultable=pre_failure.consultable,
                 )
                 return self._route_failure(pre_failure, tool_call, invoice_id)
 
@@ -276,7 +276,7 @@ class Coordinator:
                 verif_span.set_attribute("outcome", "failed")
                 record_verification_failure(
                     rule=post_failure.rule,
-                    consultable=post_failure.rule in CONSULTABLE_RULES,
+                    consultable=post_failure.consultable,
                 )
                 return self._route_failure(post_failure, tool_call, invoice_id)
 
@@ -415,13 +415,13 @@ class Coordinator:
     ) -> ToolResult | CoordinatorResult:
         """Route a verification failure based on its consultability.
 
-        The `CONSULTABLE_RULES` frozenset (see ADR-006) partitions
-        verification rules into two classes. Consultable failures
-        are returned to the LLM as a tool-error payload so the agent
-        can call `consult_procurement` and potentially recover; the
-        run continues. Hard failures terminate the run with a
-        mapped `CoordinatorResult` status and never reach the LLM
-        again.
+        Each `VerificationFailure` carries a `consultable` flag (see
+        ADR-006) that partitions rules into two classes. Consultable
+        failures are returned to the LLM as a tool-error payload so
+        the agent can call `consult_procurement` and potentially
+        recover; the run continues. Hard failures terminate the run
+        with a mapped `CoordinatorResult` status and never reach the
+        LLM again.
 
         Args:
             failure: The `VerificationFailure` produced by either
@@ -439,7 +439,7 @@ class Coordinator:
             when the rule is consultable, or a terminal
             `CoordinatorResult` when the rule is hard.
         """
-        if failure.rule in CONSULTABLE_RULES:
+        if failure.consultable:
             payload = {
                 "verification_failed": True,
                 "rule": failure.rule,
@@ -508,6 +508,7 @@ class Coordinator:
                         f"per invoice reached for invoice {invoice_id}. "
                         f"Escalate to human instead."
                     ),
+                    consultable=False,
                 )
             return None
 
@@ -522,6 +523,7 @@ class Coordinator:
                         f"authoritative recipient is unknown. The agent "
                         f"must call get_po_limit before request_approval."
                     ),
+                    consultable=False,
                 )
             # Coordinator-managed parameter injection per ADR-005:
             # the recipient is determined by the system from authoritative
@@ -546,6 +548,7 @@ class Coordinator:
                     f"fetched. The agent must call get_invoice_data before "
                     f"book_invoice."
                 ),
+                consultable=False,
             )
 
         params_amount = params.get("amount_eur")
@@ -557,6 +560,7 @@ class Coordinator:
                     f"amount_eur={params_amount} but the authoritative amount "
                     f"from get_invoice_data is {state_amount}. Refusing to book."
                 ),
+                consultable=False,
             )
 
         authoritative_amount = state_amount
