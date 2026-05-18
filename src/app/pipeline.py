@@ -237,9 +237,14 @@ class Coordinator:
             )
 
         # --- Pre-Execute Verification ---
+        # Dispatch in two layers during the lifecycle migration: the tool's
+        # own verify_before fires first; if it returns None we fall back to
+        # the Coordinator's legacy branches for tools not yet migrated.
         with tracer.start_as_current_span("verification.pre_execute") as verif_span:
             verif_span.set_attribute("tool_name", tool_call.name)
-            pre_failure = self._pre_execute_verify(tool_call, state, invoice_id)
+            pre_failure = tool.verify_before(
+                tool_call.params, state, invoice_id
+            ) or self._pre_execute_verify(tool_call, state, invoice_id)
             if pre_failure is not None:
                 verif_span.set_attribute("rule", pre_failure.rule)
                 verif_span.set_attribute("outcome", "failed")
@@ -268,9 +273,12 @@ class Coordinator:
             )
 
         # --- Post-Execute Verification ---
+        # Same two-layer dispatch as for pre-execute.
         with tracer.start_as_current_span("verification.post_execute") as verif_span:
             verif_span.set_attribute("tool_name", tool_call.name)
-            post_failure = self._post_execute_verify(tool_call, raw_result, state, invoice_id)
+            post_failure = tool.verify_after(
+                tool_call.params, raw_result, state, invoice_id
+            ) or self._post_execute_verify(tool_call, raw_result, state, invoice_id)
             if post_failure is not None:
                 verif_span.set_attribute("rule", post_failure.rule)
                 verif_span.set_attribute("outcome", "failed")
@@ -284,18 +292,27 @@ class Coordinator:
         if tool_call.name == "consult_procurement":
             state.consultations_used += 1
 
+        # State update: tool-side first (no-op for non-migrated tools), then
+        # Coordinator's legacy branches for the tools still living here.
+        tool.update_state(raw_result, state)
         self._update_state(tool_call.name, raw_result, state)
         span.set_attribute("outcome", "ok")
         record_tool_call(tool_call.name, "ok")
 
-        return ToolResult(
-            tool_call_id=tool_call.id,
-            content=self._compress_tool_result(tool_call.name, raw_result, state),
-        )
+        # Compression: identity check distinguishes migrated tools (which
+        # return a new dict) from non-migrated tools (DefaultTool returns
+        # the raw_result reference unchanged).
+        compressed = tool.compress_result(raw_result, state)
+        if compressed is raw_result:
+            content = self._compress_tool_result(tool_call.name, raw_result, state)
+        else:
+            content = json.dumps(compressed)
+        return ToolResult(tool_call_id=tool_call.id, content=content)
 
+    # Tools still compressed via the legacy Coordinator path. Entries are
+    # removed as each tool implements compress_result in its own class.
     _COMPRESSIBLE_TOOLS: frozenset[str] = frozenset(
         {
-            "get_invoice_data",
             "get_supplier_rules",
             "get_po_limit",
             "get_budget",
@@ -356,14 +373,7 @@ class Coordinator:
         state: WorkflowState,
     ) -> dict[str, Any]:
         """Build a short summary of the materialised state for one tool."""
-        if tool_name == "get_invoice_data":
-            return {
-                "invoice_id": state.invoice_id,
-                "amount_eur": state.invoice_amount_eur,
-                "po_number": state.invoice_po_number,
-                "supplier_id": state.invoice_supplier_id,
-                "cost_center": state.invoice_cost_center,
-            }
+        # get_invoice_data moved to InvoiceTool.compress_result.
         if tool_name == "get_supplier_rules":
             return {
                 "approval_threshold_eur": state.supplier_approval_threshold_eur,
@@ -631,10 +641,9 @@ class Coordinator:
         tool_name = tool_call.name
         params = tool_call.params
 
-        # 1. Not-found check.
-        # Check tool results if fetch-took, and convert found=False into a tangible VerificationError via check_not_found
+        # 1. Not-found check (still here for tools not yet migrated to the
+        # per-tool lifecycle; migrated tools handle this in verify_after).
         if tool_name in (
-            "get_invoice_data",
             "get_po_limit",
             "get_supplier_rules",
             "get_budget",
@@ -643,7 +652,8 @@ class Coordinator:
             if failure:
                 return failure
 
-        # 2. Limit check.
+        # 2. Limit check (still here for get_po_limit, which has not yet
+        # been migrated; get_invoice_data's branch moved into InvoiceTool).
         if (
             tool_name == "get_po_limit"
             and result.get("found")
@@ -653,20 +663,6 @@ class Coordinator:
                 amount_eur=state.invoice_amount_eur,
                 limit_eur=result["limit_eur"],
                 invoice_id=state.invoice_id if state.invoice_id is not None else invoice_id,
-                po_number=result["po_number"],
-            )
-            if failure:
-                return failure
-
-        if (
-            tool_name == "get_invoice_data"
-            and result.get("found")
-            and state.po_limit_eur is not None
-        ):
-            failure = check_limit_not_exceeded(
-                amount_eur=result["net_amount_eur"],
-                limit_eur=state.po_limit_eur,
-                invoice_id=result["invoice_id"],
                 po_number=result["po_number"],
             )
             if failure:
@@ -753,13 +749,7 @@ class Coordinator:
             result: The tool's raw result dict.
             state: The mutable WorkflowState for this run.
         """
-        if tool_name == "get_invoice_data" and result.get("found"):
-            state.invoice_id = result["invoice_id"]
-            state.invoice_amount_eur = result["net_amount_eur"]
-            state.invoice_po_number = result["po_number"]
-            state.invoice_contact_person = result.get("contact_person", "")
-            state.invoice_supplier_id = result.get("supplier_id", "")
-            state.invoice_cost_center = result.get("cost_center", "")
+        # get_invoice_data moved to InvoiceTool.update_state.
 
         if tool_name == "get_supplier_rules" and result.get("found"):
             state.supplier_approval_threshold_eur = result["approval_threshold_eur"]
